@@ -1,0 +1,26 @@
+{
+  "Team Create": [
+    158,
+    0
+  ],
+  "Data Sharing": [
+    156,
+    0
+  ],
+  "Allow HTTP Requests": [
+    142,
+    0
+  ],
+  "Enable Studio Access to API Services": [
+    132,
+    0
+  ],
+  "Allow Third Party Sales": [
+    135,
+    0
+  ],
+  "Allow Third Party Teleports": [
+    158,
+    -2
+  ]
+}
