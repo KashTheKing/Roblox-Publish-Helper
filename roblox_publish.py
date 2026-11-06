@@ -50,10 +50,10 @@ DEFAULT_CONFIG = {
     "studio_path": "",  # empty = newest RobloxStudioBeta.exe in %LOCALAPPDATA%\Roblox\Versions
     "open_with": True,  # list this app under "Open with" for .rbxl/.rbxlx files
     # Toggle label text -> wanted state. Add any toggle by its label, then calibrate it.
-    "publish_toggles": {
-        "Team Create": False,
-        "Data Sharing": False,
-    },
+    # Turn OFF every switch in the Alt+P publish dialog (Team Create, Data Sharing)
+    "publish_turn_all_off": True,
+    # Then force specific ones by label, e.g. {"Team Create": true}
+    "publish_toggles": {},
     # Turn on EVERY switch in Experience Settings > Security (scrolling to the end of the list)
     "security_turn_all_on": True,
     # Then force specific ones by label, e.g. {"Allow Third Party Sales": false}
@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     # Seconds. After each click, searching starts after search_start_delay (plus any
     # delay_before for that button) and then polls every poll_interval until found or timeout.
     "search_start_delay": 0.1,
-    "delay_before": {"save_button": 0.5},
+    "delay_before": {},
     "poll_interval": 0.1,
     "step_timeout": 30,
     "toggle_timeout": 3,
@@ -78,6 +78,7 @@ BUTTONS = {
     "studio_ready": ("between the Play and Stop buttons once Studio is FULLY loaded (Play blue, Stop dull)", 110, 30),
     "file_menu": ("the word 'File' in Studio's menu bar", 34, 18),
     "switch_off": ("any OFF switch in Experience Settings > Security (just the switch)", 44, 28),
+    "switch_on": ("any ON (green) switch, e.g. Team Create in the Alt+P dialog (just the switch)", 44, 28),
     "publish_button": ("the blue Next button in the Alt+P publish dialog", 90, 30),
     "publish_close": ("the Done button on the 'Manage Audience' popup after publishing", 60, 30),
     "experience_settings": ("'Experience Settings' inside the open File menu", 140, 24),
@@ -85,7 +86,7 @@ BUTTONS = {
     "save_button": ("the Save button in Experience Settings", 70, 30),
 }
 
-COLOR_MATTERS = {"studio_ready", "switch_off"}
+COLOR_MATTERS = {"studio_ready", "switch_off", "switch_on"}
 
 cfg = dict(DEFAULT_CONFIG)
 state = {"place": None, "proc": None, "window": None, "windows_before": set()}
@@ -201,8 +202,47 @@ def screen_origin():
     return ctypes.windll.user32.GetSystemMetrics(76), ctypes.windll.user32.GetSystemMetrics(77)
 
 
+class _BitmapInfo(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32), ("biHeight", ctypes.c_int32),
+                ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16),
+                ("biCompression", ctypes.c_uint32), ("biSizeImage", ctypes.c_uint32),
+                ("biXPelsPerMeter", ctypes.c_int32), ("biYPelsPerMeter", ctypes.c_int32),
+                ("biClrUsed", ctypes.c_uint32), ("biClrImportant", ctypes.c_uint32), ("pad", ctypes.c_uint32 * 3)]
+
+
 def grab_box(left, top, right, bottom):
-    return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)  # bbox is in desktop coords
+    """Screenshot of one rectangle (desktop coords, any monitor). Copies just that rectangle -
+    Pillow's ImageGrab copies every monitor and then crops, ~10x slower."""
+    gdi, user32 = ctypes.windll.gdi32, ctypes.windll.user32
+    for f in (gdi.CreateCompatibleDC, gdi.CreateCompatibleBitmap, gdi.SelectObject):
+        f.restype = ctypes.c_void_p
+    user32.GetDC.restype = ctypes.c_void_p
+    gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    gdi.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi.BitBlt.argtypes = [ctypes.c_void_p] + [ctypes.c_int] * 4 + [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+    gdi.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    gdi.DeleteObject.argtypes = gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    w, h = right - left, bottom - top
+    screen = user32.GetDC(None)
+    mem = gdi.CreateCompatibleDC(screen)
+    bmp = gdi.CreateCompatibleBitmap(screen, w, h)
+    try:
+        gdi.SelectObject(mem, bmp)
+        if not gdi.BitBlt(mem, 0, 0, w, h, screen, left, top, 0x00CC0020 | 0x40000000):  # SRCCOPY|CAPTUREBLT
+            raise OSError("screen grab failed")
+        info = _BitmapInfo(biSize=40, biWidth=w, biHeight=-h, biPlanes=1, biBitCount=32)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not gdi.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(info), 0):
+            raise OSError("screen grab failed")
+        return Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
+    finally:
+        gdi.DeleteObject(bmp)
+        gdi.DeleteDC(mem)
+        user32.ReleaseDC(None, screen)
 
 
 def grab(x, y, w, h):
@@ -257,14 +297,21 @@ def detail(a, k=9):
 
 
 class Prepared:
-    """An image ready for matching: fine detail at full size, plus a half-size copy that
-    makes the first, whole-window search ~4x faster."""
+    """An image ready for matching. The whole-window search runs on a half-size copy (4x less
+    work); full-size detail is only worked out for the small patches that need checking."""
 
     def __init__(self, gray_img):
-        self.full = detail(gray_img)
-        h, w = (s // 2 * 2 for s in self.full.shape)
-        self.half = self.full[:h, :w].reshape(h // 2, 2, w // 2, 2).mean((1, 3))
+        self.raw = gray_img
+        h, w = (s // 2 * 2 for s in gray_img.shape)
+        self.half = detail(gray_img[:h, :w].reshape(h // 2, 2, w // 2, 2).mean((1, 3)), k=5)
         self._fft = None
+        self._full = None
+
+    @property
+    def full(self):  # only ever needed for small images (the buttons), so computed on demand
+        if self._full is None:
+            self._full = detail(self.raw)
+        return self._full
 
     def half_fft(self):  # the screen's FFT is shared by every image searched in one screenshot
         if self._fft is None:
@@ -277,11 +324,10 @@ def locate(hay, needle, min_score):
     return locate_prepared(Prepared(hay), Prepared(needle), min_score)
 
 
-def locate_prepared(hay, needle, min_score):
-    """Normalized cross-correlation on fine detail: compares the *shape* of light and dark,
-    so a lighter, darker, tinted or gradient background still matches. 1.0 = identical.
-    A toolbar with the Play/Stop icons missing (Studio still loading) scores near 0.
-    Searches the half-size images first, then confirms at full size around the best spot."""
+def half_scores(hay, needle):
+    """Normalized cross-correlation on fine detail, at half size: compares the *shape* of
+    light and dark, so a lighter, darker, tinted or gradient background still matches.
+    1.0 = identical. A toolbar with the Play/Stop icons missing scores near 0."""
     H, W = hay.half.shape
     h, w = needle.half.shape
     if h > H or w > W or h < 4 or w < 4:
@@ -301,28 +347,50 @@ def locate_prepared(hay, needle, min_score):
     var = box_sum(hay.half * hay.half) - s * s / (h * w)  # window variance * pixel count
     score = corr / (np.sqrt(np.maximum(var, 1e-6)) * n_norm)
     score[var < 1 * h * w] = -1  # flat patches can't hold anything we look for
-    # Half size blurs thin text, so it only shortlists spots; the full-size check decides
+    return score
+
+
+def locate_all(hay, needle, min_score, limit=1):
+    """Top-left corners of up to `limit` separate matches, best first. Half size only
+    shortlists spots (it blurs thin text); the full-size check decides."""
+    score = half_scores(hay, needle)
+    if score is None:
+        return []
+    h, w = needle.half.shape
     flat = score.ravel()
-    top = np.argpartition(flat, -5)[-5:] if flat.size > 5 else np.arange(flat.size)
-    best = None
+    k = min(flat.size, 8 * limit + 4)
+    top = np.argpartition(flat, -k)[-k:]
+    hits = []
     for i in top[np.argsort(-flat[top])]:
-        if flat[i] < min_score - 0.4:
+        if flat[i] < min_score - 0.4 or len(hits) >= limit:
             break
-        y, x = np.unravel_index(i, score.shape)
-        if hit := refine(hay.full, needle.full, 2 * int(x), 2 * int(y), min_score):
-            return hit
-    return best
+        y, x = (2 * int(v) for v in np.unravel_index(i, score.shape))
+        if any(abs(x - hx) < w and abs(y - hy) < h for hx, hy in hits):
+            continue  # same spot as one we already have
+        if hit := refine(hay, needle, x, y, min_score):
+            hits.append(hit)
+    return hits
+
+
+def locate_prepared(hay, needle, min_score):
+    hits = locate_all(hay, needle, min_score)
+    return hits[0] if hits else None
 
 
 def refine(hay, needle, x0, y0, min_score, reach=3):
-    """Best full-size match within a few pixels of (x0, y0), or None."""
-    h, w = needle.shape
-    n = needle - needle.mean()
+    """Best full-size match within a few pixels of (x0, y0), or None. Works out full-size
+    detail for just that patch of the screen."""
+    h, w = needle.raw.shape
+    H, W = hay.raw.shape
+    n = needle.full - needle.full.mean()
     n_norm = np.sqrt((n * n).sum())
+    pad = reach + 6  # margin so the patch's own edges don't skew its detail
+    ys, xs = max(0, y0 - pad), max(0, x0 - pad)
+    patch = detail(hay.raw[ys:y0 + h + pad, xs:x0 + w + pad])
     best, best_pos = -2.0, None
-    for y in range(max(0, y0 - reach), min(hay.shape[0] - h, y0 + reach) + 1):
-        for x in range(max(0, x0 - reach), min(hay.shape[1] - w, x0 + reach) + 1):
-            p = hay[y:y + h, x:x + w]
+    for y in range(max(0, y0 - reach), min(H - h, y0 + reach) + 1):
+        for x in range(max(0, x0 - reach), min(W - w, x0 + reach) + 1):
+            p = patch[y - ys:y - ys + h, x - xs:x - xs + w]
             p = p - p.mean()
             denom = np.sqrt((p * p).sum()) * n_norm
             if denom > 1e-6 and (s := (p * n).sum() / denom) > best:
@@ -362,6 +430,59 @@ def load_template(path, built_in):
     return img
 
 
+# Where in Studio's window each item can be (fractions of width/height): searching less
+# screen is much faster. Anything not listed is searched in the middle, where dialogs open.
+REGIONS = {
+    "studio_ready": (0, 0, 0.4, 0.15),
+    "file_menu": (0, 0, 0.3, 0.1),
+    "experience_settings": (0, 0, 0.35, 0.7),
+}
+DIALOG_REGION = (0.1, 0.05, 0.9, 0.97)
+
+
+def region_area(name):
+    """Screen box to search for `name`: its part of Studio's window (or the whole desktop).
+    Dialog items are searched in just the Studio dialog that's in front, if there is one."""
+    area = studio_area()
+    if not area:
+        return None
+    if name not in REGIONS and (dialog := studio_dialog_rect()):
+        return dialog
+    x0, y0, x1, y1 = REGIONS.get(name, DIALOG_REGION)
+    left, top, right, bottom = area
+    w, h = right - left, bottom - top
+    return left + round(w * x0), top + round(h * y0), left + round(w * x1), top + round(h * y1)
+
+
+def studio_dialog_rect():
+    """Screen box of the Studio dialog in front (Publish, Experience Settings...), or None."""
+    user32 = ctypes.windll.user32
+    fg = user32.GetForegroundWindow()
+    w = state["window"]
+    if not w or fg == w._hWnd or exe_name(fg) != "robloxstudiobeta.exe":
+        return None
+    r = wintypes.RECT()
+    user32.GetWindowRect(fg, ctypes.byref(r))
+    if r.right - r.left < 300 or r.bottom - r.top < 200:  # a tooltip or menu, not a dialog
+        return None
+    return r.left, r.top, r.right, r.bottom
+
+
+def screenshot(area):
+    """Windows refuses screenshots for a moment while the lock screen or a security prompt
+    is up - keep trying instead of crashing."""
+    if area is None:  # whole desktop, all monitors
+        ox, oy = screen_origin()
+        u = ctypes.windll.user32
+        area = (ox, oy, ox + u.GetSystemMetrics(78), oy + u.GetSystemMetrics(79))
+    for _ in range(40):
+        try:
+            return grab_box(*area)
+        except OSError:
+            wait(0.25)
+    raise Fail("can't take screenshots - is the PC locked or a security prompt open?")
+
+
 def studio_area():
     """Search only inside Studio's window, so screenshots of Studio elsewhere (chat apps,
     other monitors) can't be mistaken for the real thing. Whole desktop until it's known."""
@@ -374,13 +495,24 @@ def studio_area():
     return None
 
 
+_needle_cache = {}
+
+
+def load_needles(name):
+    """Every image of `name`, ready to match - loaded once and reused."""
+    key = (name, ui_scale())
+    if key not in _needle_cache:
+        _needle_cache[key] = []
+        for path, built_in in template_candidates(name):
+            rgb = load_template(path, built_in)
+            _needle_cache[key].append((Prepared(gray(rgb)), np.asarray(rgb, dtype=np.float64)))
+    return _needle_cache[key]
+
+
 def find(name, timeout):
     """Wait search_start_delay after the last action, then poll the screen for any of the
     item's images. Returns the screen position of its center, or None after timeout."""
-    needles = []
-    for path, built_in in template_candidates(name):
-        rgb = load_template(path, built_in)
-        needles.append((Prepared(gray(rgb)), np.asarray(rgb, dtype=np.float64)))
+    needles = load_needles(name)
     if not needles:
         raise Fail(f"no image for '{name}' - run: calibrate \"{name}\"")
     wait(_last_action + cfg["search_start_delay"] + cfg["delay_before"].get(name, 0) - time.time())
@@ -388,8 +520,8 @@ def find(name, timeout):
     while True:
         check_cancel()
         focus_studio()
-        area = studio_area()
-        shot = ImageGrab.grab(bbox=area, all_screens=True)
+        area = region_area(name)
+        shot = screenshot(area)
         hay = Prepared(gray(shot))
         for needle, needle_rgb in needles:
             hit = locate_prepared(hay, needle, cfg["match_score"])
@@ -455,10 +587,15 @@ def click(name, timeout=None):
     return pos
 
 
-def is_on(x, y):
-    # ponytail: "on" = the switch has saturated color (Studio's blue); off switches are grey.
+def is_on(x, y, shot=None, origin=(0, 0)):
+    # ponytail: "on" = the switch has saturated color (green/blue); off switches are grey.
     # Breaks if Roblox ever makes off switches colorful - then capture on/off images instead.
-    hsv = np.asarray(grab_box(x - 12, y - 6, x + 12, y + 6).convert("HSV"))
+    box = (x - 12, y - 6, x + 12, y + 6)
+    if shot is None:
+        img = grab_box(*box)
+    else:  # reuse a screenshot already taken (origin = its top-left on screen)
+        img = shot.crop((box[0] - origin[0], box[1] - origin[1], box[2] - origin[0], box[3] - origin[1]))
+    hsv = np.asarray(img.convert("HSV"))
     return int(((hsv[..., 1] > 120) & (hsv[..., 2] > 120)).sum()) > 10
 
 
@@ -604,6 +741,8 @@ def step_open_publish():
 
 def step_publish():
     state["last_row"] = None
+    if cfg["publish_turn_all_off"]:
+        flip_all_switches(on=False)
     for name, want in cfg["publish_toggles"].items():
         set_toggle(name, want)
     click("publish_button")  # "Next" - it publishes straight away
@@ -614,20 +753,32 @@ def step_wait_published():
 
 
 def step_open_security():
-    # Right after publishing, Studio sometimes swallows the menu click - so reopen until it shows
-    for _ in range(3):
-        if find("security_tab", 0):
+    # Right after publishing, Studio sometimes swallows a click - so check each part opened
+    # and redo just that part quickly, instead of waiting long timeouts
+    tab = None
+    for attempt in range(8):
+        if attempt and (tab := find("security_tab", 0)):  # already open (e.g. on a retry)
             break
-        focus_studio()
-        pg.press("esc")  # close a half-open menu, if any
+        item = find("experience_settings", 0) if attempt else None  # File menu already open?
+        if not item:
+            if attempt:
+                focus_studio()
+                pg.press("esc")  # close any half-open menu
+                mark()
+            click("file_menu")
+            if not (item := find("experience_settings", 1.5)):
+                continue
+        pg.click(*item)
         mark()
-        click("file_menu")
-        click("experience_settings")
-        if find("security_tab", 10):
+        print("    clicked experience_settings")
+        if tab := find("security_tab", 4):
             break
     else:
         raise Fail("Experience Settings didn't open")
-    state["security_tab_pos"] = click("security_tab")
+    pg.click(*tab)
+    mark()
+    print("    clicked security_tab")
+    state["security_tab_pos"] = tab
 
 
 def step_security():
@@ -637,36 +788,84 @@ def step_security():
     state["changed"] = state.get("changed") or any(changed)
 
 
+def find_switches(on):
+    """Screen centers of every ON (or OFF) switch visible in Studio, top to bottom."""
+    focus_studio()
+    area = region_area("switch")
+    shot = screenshot(area)
+    hay = Prepared(gray(shot))
+    ox, oy = area[:2] if area else screen_origin()
+    found = []
+    for needle, needle_rgb in load_needles("switch_on" if on else "switch_off"):
+        h, w = needle.full.shape
+        for x, y in locate_all(hay, needle, cfg["match_score"], limit=20):
+            center = (x + ox + w // 2, y + oy + h // 2)
+            # ON and OFF switches are the same shape (knob mirrored), so check the color too
+            if colors_match(shot, (x, y), needle_rgb) and is_on(*center, shot, (ox, oy)) == on:
+                found.append(center)
+    return sorted(found, key=lambda p: p[1])
+
+
+def wait_until_still(timeout=1.5):
+    """Wait until the dialog (or the middle of Studio) stops changing - animations finished.
+    Two identical screenshots 50 ms apart = settled. Usually takes 0.1-0.3 s."""
+    area = region_area("switch")
+    grab = lambda: np.asarray(screenshot(area).convert("L"), dtype=np.int16)
+    prev = grab()
+    end = time.time() + timeout
+    while time.time() < end:
+        wait(0.05)
+        cur = grab()
+        if cur.shape == prev.shape and np.abs(cur - prev).mean() < 0.3:
+            return
+        prev = cur
+
+
+def flip_all_switches(on):
+    """Flip every switch that's in the wrong state. Turning the first Security switch on makes
+    Studio insert a warning banner that pushes every row down, so: flip one, look again, then
+    flip all the rest at once (bottom to top) and look once more to confirm.
+    Returns True if anything changed."""
+    changed, seen = False, []
+    for _ in range(8):
+        check_cancel()
+        switches = find_switches(on=not on)
+        if not switches:
+            return changed
+        if seen.count(switches) >= 2:  # same ones keep showing up: they aren't flipping
+            raise Fail(f"switches at {switches} won't turn {'on' if on else 'off'}")
+        seen.append(switches)
+        for pos in reversed(switches if changed else switches[:1]):
+            pg.click(*pos)
+            print(f"    turned {'on' if on else 'off'} a switch at {pos}")
+        mark()
+        wait_until_still()  # the banner slides in - wait for the rows to settle
+        changed = True
+    return changed
+
+
 def turn_on_all_switches():
-    """Click every OFF switch on screen, scroll the list down, repeat until it stops moving."""
+    """From the top of the list: click the topmost OFF switch, look again (turning one on can
+    insert a warning banner that shifts every row), and scroll down when none are left -
+    until the list stops moving."""
     tab = state.get("security_tab_pos")  # selected tabs look different, so use where we clicked
     s = ui_scale()
     scroll_at = (tab[0] + round(600 * s), tab[1] + round(150 * s)) if tab else None
+    if scroll_at:
+        pg.moveTo(*scroll_at)
+        pg.scroll(2400)  # start at the top
+        mark()
+        wait_until_still()
     changed = False
     for _page in range(10):
-        clicks = []
-        for _ in range(15):  # each click turns one switch green, so it stops matching
-            pos = find("switch_off", 0)
-            if not pos or is_on(*pos):  # never click a switch that's already on
-                break
-            # Turning one on can insert a warning banner that shifts every row, so don't check
-            # the old spot - just look again. Only a switch that keeps showing up OFF in the
-            # same place is a real failure.
-            if clicks.count(pos) >= 2:
-                raise Fail(f"a switch at {pos} won't turn on")
-            pg.click(*pos)
-            mark()
-            wait(0.3)
-            clicks.append(pos)
-            print(f"    turned on a switch at {pos}")
-            changed = True
+        changed = flip_all_switches(on=True) or changed
         if not scroll_at:
             break
         before = gray(grab(*scroll_at, 400, 300))
         pg.moveTo(*scroll_at)
         pg.scroll(-1200)
         mark()
-        wait(0.3)
+        wait_until_still()
         if np.abs(gray(grab(*scroll_at, 400, 300)) - before).mean() < 1:  # end of the list
             break
     return changed
@@ -707,8 +906,10 @@ def run():
     while i < len(STEPS):
         label, fn = STEPS[i]
         print(f"[{i + 1}/{len(STEPS)}] {label}")
+        started = time.time()
         try:
             fn()
+            print(f"    ({time.time() - started:.1f}s)")
             i += 1
             continue
         except Fail as e:
