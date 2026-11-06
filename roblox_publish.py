@@ -33,7 +33,7 @@ import numpy as np
 import pyautogui as pg
 from PIL import Image, ImageGrab
 
-pg.PAUSE = 0.05  # pyautogui waits 0.1s after every action by default; Studio keeps up fine
+pg.PAUSE = 0.02  # pyautogui waits 0.1s after every action by default; Studio keeps up fine
 
 FROZEN = getattr(sys, "frozen", False)
 # Next to the .exe when frozen (PyInstaller's __file__ is a temp dir that gets wiped)
@@ -350,9 +350,10 @@ def half_scores(hay, needle):
     return score
 
 
-def locate_all(hay, needle, min_score, limit=1):
+def locate_all(hay, needle, min_score, limit=1, worth_checking=None):
     """Top-left corners of up to `limit` separate matches, best first. Half size only
-    shortlists spots (it blurs thin text); the full-size check decides."""
+    shortlists spots (it blurs thin text); the full-size check decides. `worth_checking(x, y)`
+    can rule spots out cheaply before that full-size check."""
     score = half_scores(hay, needle)
     if score is None:
         return []
@@ -367,6 +368,8 @@ def locate_all(hay, needle, min_score, limit=1):
         y, x = (2 * int(v) for v in np.unravel_index(i, score.shape))
         if any(abs(x - hx) < w and abs(y - hy) < h for hx, hy in hits):
             continue  # same spot as one we already have
+        if worth_checking and not worth_checking(x, y):
+            continue
         if hit := refine(hay, needle, x, y, min_score):
             hits.append(hit)
     return hits
@@ -639,6 +642,13 @@ def exe_name(hwnd):
     return os.path.basename(buf.value).lower() if ok else ""
 
 
+def window_title(hwnd):
+    user32 = ctypes.windll.user32
+    buf = ctypes.create_unicode_buffer(user32.GetWindowTextLengthW(hwnd) + 1)
+    user32.GetWindowTextW(hwnd, buf, len(buf))
+    return buf.value
+
+
 def studio_windows():
     return [w for w in pg.getAllWindows() if w.visible and exe_name(w._hWnd) == "robloxstudiobeta.exe"]
 
@@ -654,12 +664,10 @@ def focus_studio():
     fg = user32.GetForegroundWindow()
     if fg == hwnd and not user32.IsIconic(hwnd):  # common case: nothing to do, skip the window scan
         return
-    # Fine if our window, or a Studio dialog, is in front - but not another place's Studio window
-    other_mains = {s._hWnd for s in studio_windows() if s.title.endswith("Roblox Studio")} - {hwnd}
     if user32.IsIconic(hwnd):  # minimized - a Studio popup can still be "in front" meanwhile
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE (back to maximized if it was)
-    elif fg == hwnd or (exe_name(fg) == "robloxstudiobeta.exe" and fg not in other_mains):
-        return
+    elif exe_name(fg) == "robloxstudiobeta.exe" and not window_title(fg).endswith("Roblox Studio"):
+        return  # a Studio dialog is in front - fine (another place's main window isn't)
     try:
         pg.press("alt")  # Windows only lets an app change the front window right after a key press
         mark()
@@ -779,6 +787,7 @@ def step_open_security():
     mark()
     print("    clicked security_tab")
     state["security_tab_pos"] = tab
+    state["security_tab_fresh"] = True
 
 
 def step_security():
@@ -798,11 +807,12 @@ def find_switches(on):
     found = []
     for needle, needle_rgb in load_needles("switch_on" if on else "switch_off"):
         h, w = needle.full.shape
-        for x, y in locate_all(hay, needle, cfg["match_score"], limit=20):
-            center = (x + ox + w // 2, y + oy + h // 2)
-            # ON and OFF switches are the same shape (knob mirrored), so check the color too
-            if colors_match(shot, (x, y), needle_rgb) and is_on(*center, shot, (ox, oy)) == on:
-                found.append(center)
+        # ON and OFF switches are the same shape (knob mirrored), so the color decides - and
+        # checking it first skips the slower shape check for every switch already right
+        right_state = lambda x, y: is_on(x + ox + w // 2, y + oy + h // 2, shot, (ox, oy)) == on
+        for x, y in locate_all(hay, needle, cfg["match_score"], limit=20, worth_checking=right_state):
+            if colors_match(shot, (x, y), needle_rgb):
+                found.append((x + ox + w // 2, y + oy + h // 2))
     return sorted(found, key=lambda p: p[1])
 
 
@@ -814,7 +824,7 @@ def wait_until_still(timeout=1.5):
     prev = grab()
     end = time.time() + timeout
     while time.time() < end:
-        wait(0.05)
+        wait(0.03)
         cur = grab()
         if cur.shape == prev.shape and np.abs(cur - prev).mean() < 0.3:
             return
@@ -851,7 +861,7 @@ def turn_on_all_switches():
     tab = state.get("security_tab_pos")  # selected tabs look different, so use where we clicked
     s = ui_scale()
     scroll_at = (tab[0] + round(600 * s), tab[1] + round(150 * s)) if tab else None
-    if scroll_at:
+    if scroll_at and not state.pop("security_tab_fresh", False):  # a freshly opened tab starts at the top
         pg.moveTo(*scroll_at)
         pg.scroll(2400)  # start at the top
         mark()
