@@ -6,7 +6,7 @@ Publishes a Roblox place file from start to finish without you touching anything
 2. Waits until Studio has fully loaded (Play button ready, not just the window showing)
 3. Opens the publish dialog (Alt+P), sets **Team Create** and **Data Sharing** (both **off** by default), publishes
 4. Closes the "Manage Audience" popup
-5. Opens **File > Experience Settings > Security**, sets each toggle the way you chose (all **on** by default), saves
+5. Opens **File > Experience Settings > Security**, turns **every** switch on (scrolling to the end of the list), saves
 
 Built for quickly getting test places (for example ones built with Rojo) published as private experiences.
 
@@ -26,7 +26,7 @@ The first run asks three questions (press Enter to keep each default):
 - the Roblox Studio exe to launch (default: always the newest installed version)
 - whether to add the app to "Open with" for place files
 
-**Hands off while it runs.** Any mouse or keyboard input cancels the current step. Three seconds later it offers a retry, and pressing Enter retries *from the step that stopped*. The same retry shows up if anything goes wrong, for example if Studio wants you to log in first. Closing the window stops it at any time. When publishing succeeds, the window closes by itself.
+**Press Esc (or close its window) to stop it at any time.** It moves the mouse and clicks in Studio, so leave the mouse alone while it runs. If anything goes wrong, for example Studio wants you to log in first, its window comes back and pressing Enter retries *from the step that stopped*. When publishing succeeds, the window closes by itself.
 
 ## Settings
 
@@ -38,7 +38,8 @@ Everything is in `config.json` next to the exe:
 | `studio_path` | Studio exe to launch (empty = newest install) |
 | `open_with` | Add to "Open with" for `.rbxl`/`.rbxlx` |
 | `publish_toggles` | Toggles in the publish dialog → `true` (on) / `false` (off) |
-| `security_toggles` | Toggles under Experience Settings > Security → on / off |
+| `security_turn_all_on` | Turn on every switch in Experience Settings > Security (default `true`) |
+| `security_toggles` | Then force specific Security toggles by label, e.g. `{"Allow Third Party Sales": false}` |
 | `search_start_delay` | Seconds to wait after a click before looking for the next button |
 | `delay_before` | Extra wait before specific buttons (Save gets 1.5s) |
 | `poll_interval`, `step_timeout`, `toggle_timeout`, `publish_timeout`, `studio_load_timeout` | How often and how long it searches |

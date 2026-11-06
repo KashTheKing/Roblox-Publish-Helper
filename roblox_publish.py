@@ -33,6 +33,8 @@ import numpy as np
 import pyautogui as pg
 from PIL import Image, ImageGrab
 
+pg.PAUSE = 0.05  # pyautogui waits 0.1s after every action by default; Studio keeps up fine
+
 FROZEN = getattr(sys, "frozen", False)
 # Next to the .exe when frozen (PyInstaller's __file__ is a temp dir that gets wiped)
 APP_DIR = Path(sys.executable if FROZEN else __file__).parent
@@ -52,22 +54,20 @@ DEFAULT_CONFIG = {
         "Team Create": False,
         "Data Sharing": False,
     },
-    "security_toggles": {
-        "Allow HTTP Requests": True,
-        "Enable Studio Access to API Services": True,
-        "Allow Third Party Sales": True,
-        "Allow Third Party Teleports": True,
-    },
+    # Turn on EVERY switch in Experience Settings > Security (scrolling to the end of the list)
+    "security_turn_all_on": True,
+    # Then force specific ones by label, e.g. {"Allow Third Party Sales": false}
+    "security_toggles": {},
     # Seconds. After each click, searching starts after search_start_delay (plus any
     # delay_before for that button) and then polls every poll_interval until found or timeout.
-    "search_start_delay": 0.3,
-    "delay_before": {"save_button": 1.5},
-    "poll_interval": 0.25,
+    "search_start_delay": 0.1,
+    "delay_before": {"save_button": 0.5},
+    "poll_interval": 0.1,
     "step_timeout": 30,
-    "toggle_timeout": 8,
+    "toggle_timeout": 3,
     "publish_timeout": 180,
     "studio_load_timeout": 180,
-    "after_load_delay": 5,
+    "after_load_delay": 1,
     # How alike (0-1) the screen must be to a button image. Real matches score ~0.95+.
     # Lower a little if buttons aren't found, raise if it clicks too early.
     "match_score": 0.8,
@@ -76,13 +76,16 @@ DEFAULT_CONFIG = {
 # name: (calibration hint, capture width, capture height)
 BUTTONS = {
     "studio_ready": ("between the Play and Stop buttons once Studio is FULLY loaded (Play blue, Stop dull)", 110, 30),
-    "file_menu": ("the 'File' menu, top-left of Studio", 50, 24),
+    "file_menu": ("the word 'File' in Studio's menu bar", 34, 18),
+    "switch_off": ("any OFF switch in Experience Settings > Security (just the switch)", 44, 28),
     "publish_button": ("the blue Next button in the Alt+P publish dialog", 90, 30),
     "publish_close": ("the Done button on the 'Manage Audience' popup after publishing", 60, 30),
     "experience_settings": ("'Experience Settings' inside the open File menu", 140, 24),
     "security_tab": ("the 'Security' tab in Experience Settings", 80, 26),
     "save_button": ("the Save button in Experience Settings", 70, 30),
 }
+
+COLOR_MATTERS = {"studio_ready", "switch_off"}
 
 cfg = dict(DEFAULT_CONFIG)
 state = {"place": None, "proc": None, "window": None, "windows_before": set()}
@@ -253,39 +256,78 @@ def detail(a, k=9):
     return a - box / (k * k)
 
 
+class Prepared:
+    """An image ready for matching: fine detail at full size, plus a half-size copy that
+    makes the first, whole-window search ~4x faster."""
+
+    def __init__(self, gray_img):
+        self.full = detail(gray_img)
+        h, w = (s // 2 * 2 for s in self.full.shape)
+        self.half = self.full[:h, :w].reshape(h // 2, 2, w // 2, 2).mean((1, 3))
+        self._fft = None
+
+    def half_fft(self):  # the screen's FFT is shared by every image searched in one screenshot
+        if self._fft is None:
+            self._fft = np.fft.rfft2(self.half)
+        return self._fft
+
+
 def locate(hay, needle, min_score):
-    hay, needle = detail(hay), detail(needle)
-    return _locate(hay, needle, min_score)
+    """Top-left (x, y) of the best match of needle (2-D gray arrays) in hay, or None."""
+    return locate_prepared(Prepared(hay), Prepared(needle), min_score)
 
 
-def _locate(hay, needle, min_score):
-    """Top-left (x, y) of the best match, or None if its score is below min_score.
-
-    Normalized cross-correlation: compares the *shape* of light and dark, so a background
-    that's lighter, darker or tinted (Windows tints Studio's toolbar with your wallpaper)
-    still matches. 1.0 = identical. A toolbar with the Play/Stop icons missing (Studio
-    still loading) scores near 0."""
-    H, W = hay.shape
-    h, w = needle.shape
-    if h > H or w > W:
+def locate_prepared(hay, needle, min_score):
+    """Normalized cross-correlation on fine detail: compares the *shape* of light and dark,
+    so a lighter, darker, tinted or gradient background still matches. 1.0 = identical.
+    A toolbar with the Play/Stop icons missing (Studio still loading) scores near 0.
+    Searches the half-size images first, then confirms at full size around the best spot."""
+    H, W = hay.half.shape
+    h, w = needle.half.shape
+    if h > H or w > W or h < 4 or w < 4:
         return None
-    n = needle - needle.mean()
+    n = needle.half - needle.half.mean()
     n_norm = np.sqrt((n * n).sum())
     if n_norm < 1e-6:
         return None
-    corr = np.fft.irfft2(np.fft.rfft2(hay) * np.conj(np.fft.rfft2(n, s=hay.shape)), s=hay.shape)
+    corr = np.fft.irfft2(hay.half_fft() * np.conj(np.fft.rfft2(n, s=(H, W))), s=(H, W))
     corr = corr[: H - h + 1, : W - w + 1]
 
     def box_sum(a):  # sum over every h x w window
         ii = np.pad(a.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
         return ii[h:, w:] - ii[:-h, w:] - ii[h:, :-w] + ii[:-h, :-w]
 
-    s = box_sum(hay)
-    var = box_sum(hay * hay) - s * s / (h * w)  # window variance * pixel count
+    s = box_sum(hay.half)
+    var = box_sum(hay.half * hay.half) - s * s / (h * w)  # window variance * pixel count
     score = corr / (np.sqrt(np.maximum(var, 1e-6)) * n_norm)
-    score[var < 4 * h * w] = -1  # flat patches (std < 2) can't hold anything we look for
-    y, x = np.unravel_index(np.argmax(score), score.shape)
-    return (int(x), int(y)) if score[y, x] >= min_score else None
+    score[var < 1 * h * w] = -1  # flat patches can't hold anything we look for
+    # Half size blurs thin text, so it only shortlists spots; the full-size check decides
+    flat = score.ravel()
+    top = np.argpartition(flat, -5)[-5:] if flat.size > 5 else np.arange(flat.size)
+    best = None
+    for i in top[np.argsort(-flat[top])]:
+        if flat[i] < min_score - 0.4:
+            break
+        y, x = np.unravel_index(i, score.shape)
+        if hit := refine(hay.full, needle.full, 2 * int(x), 2 * int(y), min_score):
+            return hit
+    return best
+
+
+def refine(hay, needle, x0, y0, min_score, reach=3):
+    """Best full-size match within a few pixels of (x0, y0), or None."""
+    h, w = needle.shape
+    n = needle - needle.mean()
+    n_norm = np.sqrt((n * n).sum())
+    best, best_pos = -2.0, None
+    for y in range(max(0, y0 - reach), min(hay.shape[0] - h, y0 + reach) + 1):
+        for x in range(max(0, x0 - reach), min(hay.shape[1] - w, x0 + reach) + 1):
+            p = hay[y:y + h, x:x + w]
+            p = p - p.mean()
+            denom = np.sqrt((p * p).sum()) * n_norm
+            if denom > 1e-6 and (s := (p * n).sum() / denom) > best:
+                best, best_pos = s, (x, y)
+    return best_pos if best >= min_score else None
 
 
 def colors_match(shot, hit, needle_rgb):
@@ -338,7 +380,7 @@ def find(name, timeout):
     needles = []
     for path, built_in in template_candidates(name):
         rgb = load_template(path, built_in)
-        needles.append((gray(rgb), np.asarray(rgb, dtype=np.float64)))
+        needles.append((Prepared(gray(rgb)), np.asarray(rgb, dtype=np.float64)))
     if not needles:
         raise Fail(f"no image for '{name}' - run: calibrate \"{name}\"")
     wait(_last_action + cfg["search_start_delay"] + cfg["delay_before"].get(name, 0) - time.time())
@@ -348,13 +390,14 @@ def find(name, timeout):
         focus_studio()
         area = studio_area()
         shot = ImageGrab.grab(bbox=area, all_screens=True)
-        hay = gray(shot)
+        hay = Prepared(gray(shot))
         for needle, needle_rgb in needles:
-            hit = locate(hay, needle, cfg["match_score"])
-            # Color only matters for Play/Stop (blue vs greyed out); text has ClearType color
-            # fringes that differ pixel to pixel, so text is matched on shape alone
-            if hit and (name != "studio_ready" or colors_match(shot, hit, needle_rgb)):
-                h, w = needle.shape
+            hit = locate_prepared(hay, needle, cfg["match_score"])
+            # Color only matters for Play/Stop (blue vs greyed out) and switches (an ON switch is
+            # the same shape, but green); text has ClearType color fringes that differ pixel to
+            # pixel, so text is matched on shape alone
+            if hit and (name not in COLOR_MATTERS or colors_match(shot, hit, needle_rgb)):
+                h, w = needle.full.shape
                 ox, oy = area[:2] if area else screen_origin()
                 return hit[0] + ox + w // 2, hit[1] + oy + h // 2
         if time.time() > end:
@@ -368,22 +411,19 @@ class Cancelled(Exception):
     pass
 
 
-class _LastInput(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+_watching = False  # only during a run
+VK_ESCAPE = 0x1B
 
 
-_own_input_tick = 0
-_watching = False  # only during a run; calibration needs the user's mouse
+def esc_pressed():
+    """True if Esc is down now or was pressed since the last check (works whatever window
+    is in front). Reading it also clears the 'pressed since' flag."""
+    return bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8001)
 
 
 def check_cancel():
-    """Any mouse/keyboard input newer than our own last action = the user wants to stop."""
-    if not _watching:
-        return
-    li = _LastInput(ctypes.sizeof(_LastInput))
-    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li))
-    since_ours = (li.dwTime - _own_input_tick) & 0xFFFFFFFF  # tick counter wraps every 49 days
-    if 300 < since_ours < 0x80000000:  # 300 ms grace for our own clicks/keys to land
+    """Esc = stop. (Mouse use is fine - you can keep using the PC on another screen.)"""
+    if _watching and esc_pressed():
         raise Cancelled()
 
 
@@ -397,10 +437,11 @@ def wait(seconds):
 # ---------- actions ----------
 
 def mark():
-    """Call right after the app's own input, so it isn't mistaken for the user's."""
-    global _last_action, _own_input_tick
+    """Call right after the app's own input: times the next search, and forgets the app's
+    own Esc presses (it presses Esc to close menus) so they don't count as yours."""
+    global _last_action
     _last_action = time.time()
-    _own_input_tick = ctypes.windll.kernel32.GetTickCount()
+    esc_pressed()
 
 
 def click(name, timeout=None):
@@ -411,6 +452,7 @@ def click(name, timeout=None):
     pg.click(*pos)
     mark()
     print(f"    clicked {name}")
+    return pos
 
 
 def is_on(x, y):
@@ -440,7 +482,7 @@ def set_toggle(name, want):
         return False
     pg.click(tx, ty)
     mark()
-    time.sleep(0.5)
+    wait(0.25)
     if is_on(tx, ty) != want:
         raise Fail(f"'{name}' didn't switch {'on' if want else 'off'}")
     print(f"    {name}: turned {'on' if want else 'off'}")
@@ -473,6 +515,8 @@ def focus_studio():
         return
     hwnd = w._hWnd
     fg = user32.GetForegroundWindow()
+    if fg == hwnd and not user32.IsIconic(hwnd):  # common case: nothing to do, skip the window scan
+        return
     # Fine if our window, or a Studio dialog, is in front - but not another place's Studio window
     other_mains = {s._hWnd for s in studio_windows() if s.title.endswith("Roblox Studio")} - {hwnd}
     if user32.IsIconic(hwnd):  # minimized - a Studio popup can still be "in front" meanwhile
@@ -583,13 +627,49 @@ def step_open_security():
             break
     else:
         raise Fail("Experience Settings didn't open")
-    click("security_tab")
+    state["security_tab_pos"] = click("security_tab")
 
 
 def step_security():
     state["last_row"] = None
-    changed = [set_toggle(name, want) for name, want in cfg["security_toggles"].items()]
+    changed = cfg["security_turn_all_on"] and turn_on_all_switches()
+    changed = [set_toggle(name, want) for name, want in cfg["security_toggles"].items()] + [changed]
     state["changed"] = state.get("changed") or any(changed)
+
+
+def turn_on_all_switches():
+    """Click every OFF switch on screen, scroll the list down, repeat until it stops moving."""
+    tab = state.get("security_tab_pos")  # selected tabs look different, so use where we clicked
+    s = ui_scale()
+    scroll_at = (tab[0] + round(600 * s), tab[1] + round(150 * s)) if tab else None
+    changed = False
+    for _page in range(10):
+        clicks = []
+        for _ in range(15):  # each click turns one switch green, so it stops matching
+            pos = find("switch_off", 0)
+            if not pos or is_on(*pos):  # never click a switch that's already on
+                break
+            # Turning one on can insert a warning banner that shifts every row, so don't check
+            # the old spot - just look again. Only a switch that keeps showing up OFF in the
+            # same place is a real failure.
+            if clicks.count(pos) >= 2:
+                raise Fail(f"a switch at {pos} won't turn on")
+            pg.click(*pos)
+            mark()
+            wait(0.3)
+            clicks.append(pos)
+            print(f"    turned on a switch at {pos}")
+            changed = True
+        if not scroll_at:
+            break
+        before = gray(grab(*scroll_at, 400, 300))
+        pg.moveTo(*scroll_at)
+        pg.scroll(-1200)
+        mark()
+        wait(0.3)
+        if np.abs(gray(grab(*scroll_at, 400, 300)) - before).mean() < 1:  # end of the list
+            break
+    return changed
 
 
 def step_save():
@@ -617,9 +697,9 @@ STEPS = [
 
 def run():
     global _watching
-    print("Hands off the mouse and keyboard - touching them cancels. Closing this window stops it.")
+    print("Press Esc (or close this window) to stop at any time.")
     print("This window minimizes while it works and comes back if anything needs you.\n")
-    time.sleep(2)  # time to read that
+    time.sleep(1)  # time to read that
     show_console(False)
     i = 0
     mark()
@@ -634,9 +714,9 @@ def run():
         except Fail as e:
             print(f"\n  FAILED: {e}")
         except Cancelled:
-            print("\n  CANCELLED: you used the mouse/keyboard.")
+            print("\n  Stopped (Esc).")
+            sys.exit(0)
         _watching = False
-        time.sleep(3)  # so a stray keypress can't instantly confirm the retry
         show_console(True)
         while msvcrt.kbhit():
             msvcrt.getwch()
