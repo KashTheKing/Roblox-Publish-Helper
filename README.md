@@ -42,7 +42,7 @@ Everything is in `config.json` next to the exe:
 | `search_start_delay` | Seconds to wait after a click before looking for the next button |
 | `delay_before` | Extra wait before specific buttons (Save gets 1.5s) |
 | `poll_interval`, `step_timeout`, `toggle_timeout`, `publish_timeout`, `studio_load_timeout` | How often and how long it searches |
-| `match_tolerance` | How closely the screen must match a button image (raise slightly if buttons aren't found) |
+| `match_score` | How alike (0–1) the screen must be to a button image. Real matches score ~0.95+; lower slightly if buttons aren't found |
 
 Toggle names are the label text shown in Studio. To handle a toggle that isn't listed, add its label with `true`/`false`, then run `roblox-publish-helper.exe calibrate "Its Label"`.
 
@@ -50,7 +50,7 @@ Run `roblox-publish-helper.exe setup` to answer the first-run questions again.
 
 ## How it finds buttons
 
-It looks for small reference images of each button on screen, only inside the Studio window. Built-in images are captured from Studio's **dark theme at 100% display scaling**. If your setup looks different, or Roblox changes the UI, re-capture what's needed:
+It looks for small reference images of each button on screen, only inside the Studio window. Matching compares the pattern of light and dark, so a wallpaper-tinted or lighter/darker background doesn't throw it off. Built-in images come from Studio's **dark theme** and cover both the older UI and the November 2026 UI (some buttons have two images). They're resized automatically for Windows display scaling (125%, 150%, ...). If your setup still doesn't match, re-capture what's needed:
 
 ```
 roblox-publish-helper.exe calibrate                 # everything
