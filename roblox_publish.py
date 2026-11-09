@@ -464,6 +464,8 @@ def studio_dialog_rect():
     w = state["window"]
     if not w or fg == w._hWnd or exe_name(fg) != "robloxstudiobeta.exe":
         return None
+    if window_title(fg).endswith("Roblox Studio"):  # a main window (another place, start page)
+        return None
     r = wintypes.RECT()
     user32.GetWindowRect(fg, ctypes.byref(r))
     if r.right - r.left < 300 or r.bottom - r.top < 200:  # a tooltip or menu, not a dialog
@@ -569,10 +571,21 @@ def press_esc():
     mark()
 
 
+class Skipped(Exception):
+    pass
+
+
+VK_F8 = 0x77
+
+
 def check_cancel():
-    """Esc = stop. (Mouse use is fine - you can keep using the PC on another screen.)"""
-    if _watching and esc_pressed() and time.time() > _own_esc_until:
+    """Esc = stop, F8 = skip this step (you did it yourself). Mouse use is fine."""
+    if not _watching:
+        return
+    if esc_pressed() and time.time() > _own_esc_until:
         raise Cancelled()
+    if ctypes.windll.user32.GetAsyncKeyState(VK_F8) & 0x8001:
+        raise Skipped()
 
 
 def wait(seconds):
@@ -751,34 +764,123 @@ def step_wait_loaded():
     wait(cfg["after_load_delay"])  # let plugins/startup popups settle
 
 
+def front_dialog_title():
+    """Title of the Studio dialog in front ("Publish Experience", "Manage Audience", ...), or ""."""
+    fg = ctypes.windll.user32.GetForegroundWindow()
+    if exe_name(fg) != "robloxstudiobeta.exe":
+        return ""
+    title = window_title(fg)
+    return "" if title.endswith("Roblox Studio") else title
+
+
+def dialog_showing(title_word, image, timeout):
+    """Wait for a dialog, recognised by its window title OR its button image - the title works
+    whatever the theme, scale or Studio version; the image works if the title ever changes."""
+    end = time.time() + timeout
+    while True:
+        check_cancel()
+        if title_word in front_dialog_title().lower() or find(image, 0):
+            return True
+        if time.time() > end:
+            return False
+        wait(0.1)
+
+
 def step_open_publish():
     focus_studio()
-    if not find("publish_button", 0):
+    if not dialog_showing("publish", "publish_button", 0):
         pg.hotkey("alt", "p")
         mark()
-    if not find("publish_button", cfg["step_timeout"]):
-        raise Fail("publish dialog didn't open")
+    if not dialog_showing("publish", "publish_button", cfg["step_timeout"]):
+        raise Fail(blank_screen_hint() or "publish dialog didn't open")
 
 
 def step_publish():
     state["last_row"] = None
+    # The dialog's form draws a moment after the window opens. Never publish before its
+    # switches are visible: publishing with Team Create still on turns the place into a
+    # cloud session and closes this window.
+    end = time.time() + cfg["step_timeout"]
+    while not (find_switches(on=True) or find_switches(on=False)):
+        if time.time() > end:
+            raise Fail(blank_screen_hint() or "the publish dialog's switches (Team Create...) never showed up")
+        wait(0.1)
+    wait_until_still()
     if cfg["publish_turn_all_off"]:
-        wait_until_still()  # let the dialog finish opening before clicking in it
         flip_all_switches(on=False)
     for name, want in cfg["publish_toggles"].items():
         set_toggle(name, want)
-    click("publish_button")  # "Next" - it publishes straight away
+    click_main_button("publish_button")  # "Next" - it publishes straight away
+
+
+def blue_button_in_corner():
+    """Center of the blue button in the bottom-right corner of the Studio dialog in front
+    (Next, Save...), found by color alone - works whatever its label, size or font."""
+    rect = studio_dialog_rect()
+    if not rect:
+        return None
+    left, top, right, bottom = rect
+    edge = round(8 * ui_scale())  # skip the window border - Windows draws it in the accent color
+    box = (left + (right - left) * 55 // 100, top + (bottom - top) * 80 // 100, right - edge, bottom - edge)
+    hsv = np.asarray(grab_box(*box).convert("HSV")).astype(int)
+    # Studio's blue: hue ~150 (of 255), strongly saturated, bright
+    blue = (abs(hsv[..., 0] - 152) < 14) & (hsv[..., 1] > 120) & (hsv[..., 2] > 150)
+    if blue.sum() < 300 * ui_scale() ** 2:  # not a button-sized patch of blue
+        return None
+    # the button's rows/columns are mostly blue; stray blue bits (links, icons) aren't
+    cols, rows = blue.sum(0), blue.sum(1)
+    xs, ys = np.nonzero(cols > cols.max() * 0.5)[0], np.nonzero(rows > rows.max() * 0.5)[0]
+    return box[0] + int(xs.mean()), box[1] + int(ys.mean())
+
+
+def click_main_button(name):
+    """Click a dialog's blue main button: by its image, or else by finding the blue button in
+    the dialog's bottom-right corner (for PCs where the image doesn't match)."""
+    pos = find(name, 2)
+    how = name
+    if not pos:
+        focus_studio()
+        pos, how = blue_button_in_corner(), f"{name} (by color)"
+    if not pos:
+        raise Fail(blank_screen_hint() or f"couldn't find '{name}' on screen")
+    pg.click(*pos)
+    mark()
+    print(f"    clicked {how}")
+
+
+class RetryFrom(Fail):
+    """Go back to an earlier step automatically (e.g. publish again after an error)."""
+
+    def __init__(self, step, why):
+        super().__init__(why)
+        self.step = step
+
+
+OPEN_PUBLISH_STEP = 3  # index in STEPS
 
 
 def step_wait_published():
-    # The "Manage Audience" popup appearing = published. Esc closes it (faster than finding
-    # Done); click Done only if it's somehow still there.
-    if not find("publish_close", cfg["publish_timeout"]):  # publishing can take a while
-        raise Fail(blank_screen_hint() or "publishing didn't finish (no 'Done' popup)")
+    # The "Manage Audience" popup appearing = published. Any other Studio popup meanwhile =
+    # a publish error: close it and publish again. Can take a while (uploading).
+    end = time.time() + cfg["publish_timeout"]
+    while True:
+        check_cancel()
+        title = front_dialog_title()
+        if "audience" in title.lower() or find("publish_close", 0):
+            break
+        if title and "publish" not in title.lower():
+            press_esc()
+            wait_until_still()
+            raise RetryFrom(OPEN_PUBLISH_STEP, f"publish failed ('{title}' popup)")
+        if time.time() > end:
+            press_esc()
+            raise RetryFrom(OPEN_PUBLISH_STEP, blank_screen_hint() or "publishing didn't finish in time")
+        wait(0.25)
+    # Esc closes the popup (faster than finding Done); click Done only if it's still there
     for _ in range(3):
         press_esc()
         wait_until_still()
-        if not find("publish_close", 0):
+        if "audience" not in front_dialog_title().lower() and not find("publish_close", 0):
             print("    closed the published popup")
             return
     click("publish_close", 2)
@@ -876,6 +978,8 @@ def flip_all_switches(on):
     changed, seen = False, []
     for _ in range(20):
         check_cancel()
+        if not studio_dialog_rect():  # the dialog is gone - don't click whatever is underneath
+            raise Fail(f"the Studio dialog closed (front window: '{front_dialog_title() or 'not a dialog'}')")
         switches = find_switches(on=not on)
         if not switches:
             return changed
@@ -924,7 +1028,7 @@ def turn_on_all_switches():
 
 def step_save():
     if state.get("changed"):
-        click("save_button")
+        click_main_button("save_button")
     else:  # nothing changed = Save stays greyed out; just close the dialog
         focus_studio()
         press_esc()
@@ -959,11 +1063,13 @@ def run():
     # Keep the display on (and the PC from locking for being idle) while this runs
     ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000002 | 0x00000001)
     print("Press Esc (or close this window) to stop at any time.")
+    print("Press F8 to skip the current step (if it's stuck and you did it yourself).")
     print("This window minimizes while it works and comes back if anything needs you.\n")
     time.sleep(1)  # time to read that
     show_console(False)
-    i = 0
+    i, auto_retries = 0, 0
     mark()
+    ctypes.windll.user32.GetAsyncKeyState(VK_F8)  # forget any F8 pressed before the run
     _watching = True
     while i < len(STEPS):
         label, fn = STEPS[i]
@@ -974,17 +1080,38 @@ def run():
             print(f"    ({time.time() - started:.1f}s)")
             i += 1
             continue
+        except RetryFrom as e:
+            if auto_retries < 2:
+                auto_retries += 1
+                print(f"    {e} - trying again automatically ({auto_retries}/2)")
+                i = e.step
+                mark()
+                continue
+            print(f"\n  FAILED: {e}")
         except Fail as e:
             print(f"\n  FAILED: {e}")
+            try:  # what Studio looked like - attach it when asking for help
+                screenshot(studio_area()).save(APP_DIR / "last_failure.png")
+                print(f"  (screenshot of Studio saved to {APP_DIR / 'last_failure.png'})")
+            except Exception:
+                pass
         except Cancelled:
             print("\n  Stopped (Esc).")
             sys.exit(0)
+        except Skipped:
+            print("    skipped (F8)")
+            i += 1
+            mark()
+            continue
         _watching = False
         show_console(True)
         while msvcrt.kbhit():
             msvcrt.getwch()
-        print("  Sort out anything in Studio (log in, close popups, finish loading...),")
-        input("  then press Enter to retry this step. Close this window to give up. ")
+        print("  Sort out anything in Studio (log in, close popups, finish loading...), then:")
+        answer = input("  Enter = retry this step, S + Enter = skip it (you did it yourself): ")
+        if answer.strip().lower().startswith("s"):
+            print("    skipped")
+            i += 1
         show_console(False)
         mark()
         _watching = True
