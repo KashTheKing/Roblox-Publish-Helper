@@ -913,7 +913,20 @@ def step_publish():
             raise Fail("a switch in the publish dialog is still on - not publishing")
     for name, want in cfg["publish_toggles"].items():
         set_toggle(name, want)
+    before = dialog_pixels()
     click_main_button("publish_button")  # "Next" - it publishes straight away
+    # Next starts the upload at once: the dialog changes (progress screen) or closes. If nothing
+    # happened, the click missed - ask the user to click Next once (it's remembered).
+    end = time.time() + 3
+    while time.time() < end:
+        if "publish" not in front_dialog_title().lower():
+            return  # dialog gone (or the published popup is up)
+        now = dialog_pixels()
+        if now.shape != before.shape or np.abs(now - before).mean() >= 3:
+            return  # switched to the upload screen
+        wait(0.1)
+    print("    Next didn't react to that click")
+    teach("publish_button")
 
 
 def blue_button_in_corner():
@@ -927,8 +940,16 @@ def blue_button_in_corner():
     box = (left + (right - left) * 55 // 100, top + (bottom - top) * 80 // 100, right - edge, bottom - edge)
     hsv = np.asarray(grab_box(*box).convert("HSV")).astype(int)
     # Any strongly colored patch (Studio's blue here, but themes differ); Cancel is grey
-    blue = (hsv[..., 1] > 120) & (hsv[..., 2] > 150)
-    if blue.sum() < 300 * ui_scale() ** 2:  # not a button-sized patch of blue
+    colored = (hsv[..., 1] > 120) & (hsv[..., 2] > 150)
+    # Keep only *solid* color - a button's fill. Blue link text ("Learn more") is thin strokes,
+    # so pixels there never have a fully colored neighbourhood.
+    k = max(3, round(7 * ui_scale())) | 1
+    pad = k // 2
+    ii = np.pad(colored.astype(np.int32), ((pad + 1, pad), (pad + 1, pad))).cumsum(0).cumsum(1)
+    H, W = colored.shape
+    around = ii[k:k + H, k:k + W] - ii[:H, k:k + W] - ii[k:k + H, :W] + ii[:H, :W]
+    blue = around == k * k
+    if blue.sum() < 150 * ui_scale() ** 2:  # not a button-sized patch of color
         return None
     # the button's rows/columns are mostly blue; stray blue bits (links, icons) aren't
     cols, rows = blue.sum(0), blue.sum(1)
