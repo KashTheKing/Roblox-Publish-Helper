@@ -556,9 +556,22 @@ def esc_pressed():
     return bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8001)
 
 
+_own_esc_until = 0.0
+
+
+def press_esc():
+    """The app's own Esc (closes menus and popups) - ignored by the cancel check for a moment,
+    since Windows can report the keypress a little after it happened."""
+    global _own_esc_until
+    _own_esc_until = time.time() + 0.5
+    pg.press("esc")
+    _own_esc_until = time.time() + 0.5
+    mark()
+
+
 def check_cancel():
     """Esc = stop. (Mouse use is fine - you can keep using the PC on another screen.)"""
-    if _watching and esc_pressed():
+    if _watching and esc_pressed() and time.time() > _own_esc_until:
         raise Cancelled()
 
 
@@ -583,7 +596,7 @@ def click(name, timeout=None):
     timeout = timeout or cfg["step_timeout"]
     pos = find(name, timeout)
     if not pos:
-        raise Fail(f"couldn't find '{name}' on screen after {timeout}s")
+        raise Fail(blank_screen_hint() or f"couldn't find '{name}' on screen after {timeout}s")
     pg.click(*pos)
     mark()
     print(f"    clicked {name}")
@@ -734,7 +747,7 @@ def step_wait_loaded():
     focus_studio()
     # The File menu shows while plugins still load; Play turning blue (Stop dull) means ready
     if not find("studio_ready", cfg["studio_load_timeout"]):
-        raise Fail("Studio didn't finish loading (Play button never became ready)")
+        raise Fail(blank_screen_hint() or "Studio didn't finish loading (Play button never became ready)")
     wait(cfg["after_load_delay"])  # let plugins/startup popups settle
 
 
@@ -750,6 +763,7 @@ def step_open_publish():
 def step_publish():
     state["last_row"] = None
     if cfg["publish_turn_all_off"]:
+        wait_until_still()  # let the dialog finish opening before clicking in it
         flip_all_switches(on=False)
     for name, want in cfg["publish_toggles"].items():
         set_toggle(name, want)
@@ -757,7 +771,17 @@ def step_publish():
 
 
 def step_wait_published():
-    click("publish_close", cfg["publish_timeout"])  # publishing can take a while
+    # The "Manage Audience" popup appearing = published. Esc closes it (faster than finding
+    # Done); click Done only if it's somehow still there.
+    if not find("publish_close", cfg["publish_timeout"]):  # publishing can take a while
+        raise Fail(blank_screen_hint() or "publishing didn't finish (no 'Done' popup)")
+    for _ in range(3):
+        press_esc()
+        wait_until_still()
+        if not find("publish_close", 0):
+            print("    closed the published popup")
+            return
+    click("publish_close", 2)
 
 
 def step_open_security():
@@ -771,8 +795,7 @@ def step_open_security():
         if not item:
             if attempt:
                 focus_studio()
-                pg.press("esc")  # close any half-open menu
-                mark()
+                press_esc()  # close any half-open menu or leftover popup
             click("file_menu")
             if not (item := find("experience_settings", 1.5)):
                 continue
@@ -787,7 +810,6 @@ def step_open_security():
     mark()
     print("    clicked security_tab")
     state["security_tab_pos"] = tab
-    state["security_tab_fresh"] = True
 
 
 def step_security():
@@ -816,28 +838,43 @@ def find_switches(on):
     return sorted(found, key=lambda p: p[1])
 
 
-def wait_until_still(timeout=1.5):
+def wait_until_still(timeout=1.5, quiet=0.15, before=None, expect_change=0.0):
     """Wait until the dialog (or the middle of Studio) stops changing - animations finished.
-    Two identical screenshots 50 ms apart = settled. Usually takes 0.1-0.3 s."""
+    It must stay unchanged for `quiet` seconds. With `expect_change`, first wait up to that
+    long for the change to *start* (compared to `before`, a screenshot taken before acting):
+    Studio's smooth scrolling can begin a moment late, and the still frames before it would
+    look settled."""
     area = region_area("switch")
     grab = lambda: np.asarray(screenshot(area).convert("L"), dtype=np.int16)
-    prev = grab()
+    differs = lambda a, b: a.shape != b.shape or np.abs(a - b).mean() >= 0.3
+    if before is not None and expect_change:
+        end = time.time() + expect_change
+        while time.time() < end and not differs(grab(), before):
+            wait(0.02)
+    prev, still_since = grab(), time.time()
     end = time.time() + timeout
     while time.time() < end:
         wait(0.03)
         cur = grab()
-        if cur.shape == prev.shape and np.abs(cur - prev).mean() < 0.3:
+        if differs(cur, prev):
+            still_since = time.time()
+        elif time.time() - still_since >= quiet:
             return
         prev = cur
 
 
+def dialog_pixels():
+    """Gray screenshot of the dialog area, for wait_until_still(before=...)."""
+    return np.asarray(screenshot(region_area("switch")).convert("L"), dtype=np.int16)
+
+
 def flip_all_switches(on):
-    """Flip every switch that's in the wrong state. Turning the first Security switch on makes
-    Studio insert a warning banner that pushes every row down, so: flip one, look again, then
-    flip all the rest at once (bottom to top) and look once more to confirm.
+    """Flip every switch that's in the wrong state - one per click, looking again after each:
+    clicking a switch can make Studio scroll the list (to keep it in view) and turning the
+    first Security switch on inserts a warning banner, so rows move after every click.
     Returns True if anything changed."""
     changed, seen = False, []
-    for _ in range(8):
+    for _ in range(20):
         check_cancel()
         switches = find_switches(on=not on)
         if not switches:
@@ -845,39 +882,43 @@ def flip_all_switches(on):
         if seen.count(switches) >= 2:  # same ones keep showing up: they aren't flipping
             raise Fail(f"switches at {switches} won't turn {'on' if on else 'off'}")
         seen.append(switches)
-        for pos in reversed(switches if changed else switches[:1]):
-            pg.click(*pos)
-            print(f"    turned {'on' if on else 'off'} a switch at {pos}")
+        pos = switches[0]
+        if is_on(*pos) == on:  # re-check this exact spot right before clicking
+            continue
+        before = dialog_pixels()
+        pg.click(*pos)
         mark()
-        wait_until_still()  # the banner slides in - wait for the rows to settle
+        print(f"    turned {'on' if on else 'off'} a switch at {pos}")
+        # the switch redraws (and the list may scroll) within ~60 ms
+        wait_until_still(before=before, expect_change=0.3)
         changed = True
     return changed
 
 
 def turn_on_all_switches():
-    """From the top of the list: click the topmost OFF switch, look again (turning one on can
-    insert a warning banner that shifts every row), and scroll down when none are left -
-    until the list stops moving."""
+    """Scroll to the bottom and turn on everything there (most switches fit in that view),
+    then scroll to the top and turn on the rest."""
     tab = state.get("security_tab_pos")  # selected tabs look different, so use where we clicked
+    if not tab:
+        return flip_all_switches(on=True)
     s = ui_scale()
-    scroll_at = (tab[0] + round(600 * s), tab[1] + round(150 * s)) if tab else None
-    if scroll_at and not state.pop("security_tab_fresh", False):  # a freshly opened tab starts at the top
-        pg.moveTo(*scroll_at)
-        pg.scroll(2400)  # start at the top
-        mark()
-        wait_until_still()
+    scroll_at = (tab[0] + round(600 * s), tab[1] + round(150 * s))
     changed = False
-    for _page in range(10):
+    wait_until_still()  # Studio ignores scrolling while the tab is still drawing
+    # ponytail: the Security list is under two screens tall, so bottom + top sees every switch.
+    # If Roblox makes it much longer, middle rows get missed - then step through page by page.
+    for amount in (-6000, 6000):  # bottom, then top
+        for _ in range(3):  # retry if the scroll didn't take
+            before = dialog_pixels()
+            pg.moveTo(*scroll_at)
+            pg.scroll(amount)
+            mark()
+            # smooth scrolling can start a moment late - wait for it to start, then to stop
+            wait_until_still(before=before, expect_change=0.5)
+            after = dialog_pixels()
+            if after.shape != before.shape or np.abs(after - before).mean() >= 0.3:
+                break  # the list moved
         changed = flip_all_switches(on=True) or changed
-        if not scroll_at:
-            break
-        before = gray(grab(*scroll_at, 400, 300))
-        pg.moveTo(*scroll_at)
-        pg.scroll(-1200)
-        mark()
-        wait_until_still()
-        if np.abs(gray(grab(*scroll_at, 400, 300)) - before).mean() < 1:  # end of the list
-            break
     return changed
 
 
@@ -886,8 +927,7 @@ def step_save():
         click("save_button")
     else:  # nothing changed = Save stays greyed out; just close the dialog
         focus_studio()
-        pg.press("esc")
-        mark()
+        press_esc()
         print("    nothing changed, closed settings")
 
 
@@ -904,8 +944,20 @@ STEPS = [
 ]
 
 
+def blank_screen_hint():
+    """Windows hands out all-black screenshots while the PC is locked or the display sleeps."""
+    try:
+        if np.asarray(screenshot(None).convert("L")).max() < 8:
+            return "the screen is blank - is the PC locked or the display asleep? Unlock it first"
+    except Fail:
+        return "can't take screenshots - is the PC locked?"
+    return None
+
+
 def run():
     global _watching
+    # Keep the display on (and the PC from locking for being idle) while this runs
+    ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000002 | 0x00000001)
     print("Press Esc (or close this window) to stop at any time.")
     print("This window minimizes while it works and comes back if anything needs you.\n")
     time.sleep(1)  # time to read that
