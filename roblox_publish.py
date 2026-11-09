@@ -128,7 +128,7 @@ def ask(prompt, default, valid):
 def setup():
     print("=== Setup (press Enter to keep the value in [brackets]) ===\n")
     cfg["places_folder"] = ask("Folder you download Roblox places to:", places_folder(), os.path.isdir)
-    print(f"\nRoblox Studio that will be launched (empty = always the newest install):")
+    print("\nRoblox Studio that will be launched (empty = always the newest install):")
     cfg["studio_path"] = ask("Roblox Studio exe path:", studio_path() or "NOT FOUND", os.path.isfile)
     cfg["open_with"] = input("\nAdd to 'Open with' for .rbxl/.rbxlx files? [Y/n]: ").strip().lower() != "n"
     save_config()
@@ -614,11 +614,13 @@ def teach(name):
     show_console(True)
     print(f"\n  >>> Help needed: I can't find {hint}.")
     print("      Click it in Studio yourself - I'll remember it for next time. (Esc stops, F8 skips.)")
+    ctypes.windll.user32.MessageBeep(0x30)
+    focus_studio()  # Studio back in front, so this window can't cover what you need to click
     user32.GetAsyncKeyState(0x01)  # forget earlier clicks
     end = time.time() + cfg["teach_timeout"]
     while time.time() < end:
         check_cancel()
-        if user32.GetAsyncKeyState(0x01) & 0x8000:  # left button down
+        if user32.GetAsyncKeyState(0x01) & 0x8001:  # left button down, or clicked since last look
             pt = wintypes.POINT()
             user32.GetCursorPos(ctypes.byref(pt))
             window = user32.GetAncestor(user32.WindowFromPoint(pt), 2)  # GA_ROOT
@@ -906,6 +908,9 @@ def step_publish():
     wait_until_still()
     if cfg["publish_turn_all_off"]:
         flip_all_switches(on=False)
+        wait_until_still()
+        if find_switches(on=True):  # never publish with Team Create (or anything) still on
+            raise Fail("a switch in the publish dialog is still on - not publishing")
     for name, want in cfg["publish_toggles"].items():
         set_toggle(name, want)
     click_main_button("publish_button")  # "Next" - it publishes straight away
@@ -921,8 +926,8 @@ def blue_button_in_corner():
     edge = round(8 * ui_scale())  # skip the window border - Windows draws it in the accent color
     box = (left + (right - left) * 55 // 100, top + (bottom - top) * 80 // 100, right - edge, bottom - edge)
     hsv = np.asarray(grab_box(*box).convert("HSV")).astype(int)
-    # Studio's blue: hue ~150 (of 255), strongly saturated, bright
-    blue = (abs(hsv[..., 0] - 152) < 14) & (hsv[..., 1] > 120) & (hsv[..., 2] > 150)
+    # Any strongly colored patch (Studio's blue here, but themes differ); Cancel is grey
+    blue = (hsv[..., 1] > 120) & (hsv[..., 2] > 150)
     if blue.sum() < 300 * ui_scale() ** 2:  # not a button-sized patch of blue
         return None
     # the button's rows/columns are mostly blue; stray blue bits (links, icons) aren't
@@ -987,20 +992,28 @@ def step_wait_published():
     for _ in range(3):
         press_esc()
         wait_until_still()
-        if "audience" not in front_dialog_title().lower() and not find("publish_close", 0):
+        if "audience" not in front_dialog_title().lower():
             print("    closed the published popup")
             return
-    click("publish_close", 2)
+    if pos := find("publish_close", 2):
+        pg.click(*pos)
+        mark()
+        print("    clicked publish_close")
+    # else: leave it - the next step presses Esc before opening the File menu anyway
 
 
 def open_file_menu():
-    """Open Studio's File menu - Alt+F from the keyboard, the 'File' image as a backup.
+    """Open Studio's File menu from the keyboard (Studio ignores Alt+F, but tapping Alt selects
+    the menu bar with File highlighted, and Down opens it); the 'File' image is a backup.
     Returns where 'Experience Settings' is in it, or None."""
     focus_studio()
-    pg.hotkey("alt", "f")
+    press_esc()  # nothing half-selected, so the Alt tap selects the menu bar
+    pg.press("alt")
+    time.sleep(0.15)
+    pg.press("down")
     mark()
     if item := find("experience_settings", 1.0):
-        print("    opened File menu (Alt+F)")
+        print("    opened File menu (Alt, Down)")
         return item
     press_esc()
     if pos := find("file_menu", 1.0):
@@ -1128,37 +1141,51 @@ def flip_all_switches(on):
         pg.click(*pos)
         mark()
         print(f"    turned {'on' if on else 'off'} a switch at {pos}")
-        # the switch redraws (and the list may scroll) within ~60 ms
-        wait_until_still(before=before, expect_change=0.3)
+        # Watch until this switch has really flipped (or the list moved) before looking again:
+        # a just-opened dialog can register a click late, and clicking again would undo it.
+        end = time.time() + 1.5
+        while time.time() < end:
+            if is_on(*pos) == on:
+                break
+            now = dialog_pixels()
+            if now.shape != before.shape or np.abs(now - before).mean() >= 2:
+                break  # rows moved (warning banner, auto-scroll)
+            wait(0.03)
+        wait_until_still()
         changed = True
     return changed
 
 
 def turn_on_all_switches():
-    """Scroll to the bottom and turn on everything there (most switches fit in that view),
-    then scroll to the top and turn on the rest."""
+    """Turn on what's at the top of the list (HTTP Requests...), then scroll to the bottom once
+    and turn on the rest - no need to come back up."""
     tab = state.get("security_tab_pos")  # selected tabs look different, so use where we clicked
     if not tab:
         return flip_all_switches(on=True)
     s = ui_scale()
     scroll_at = (tab[0] + round(600 * s), tab[1] + round(150 * s))
-    changed = False
-    wait_until_still()  # Studio ignores scrolling while the tab is still drawing
-    # ponytail: the Security list is under two screens tall, so bottom + top sees every switch.
-    # If Roblox makes it much longer, middle rows get missed - then step through page by page.
-    for amount in (-6000, 6000):  # bottom, then top
-        for _ in range(3):  # retry if the scroll didn't take
+
+    def scroll(amount, tries):
+        for _ in range(tries):  # retry if the scroll didn't take
             before = dialog_pixels()
             pg.moveTo(*scroll_at)
             pg.scroll(amount)
             mark()
             # smooth scrolling can start a moment late - wait for it to start, then to stop
-            wait_until_still(before=before, expect_change=0.5)
+            wait_until_still(before=before, expect_change=0.4)
             after = dialog_pixels()
             if after.shape != before.shape or np.abs(after - before).mean() >= 0.3:
-                break  # the list moved
-        changed = flip_all_switches(on=True) or changed
-    return changed
+                return  # the list moved
+
+    wait_until_still()  # Studio ignores clicks and scrolling while the tab is still drawing
+    # The list doesn't always open at the top - go there first (once: if it's already at the
+    # top, nothing moves and there's nothing to retry)
+    scroll(6000, tries=1)
+    # ponytail: the Security list is under two screens tall, so top + bottom sees every switch.
+    # If Roblox makes it much longer, middle rows get missed - then step through page by page.
+    changed = flip_all_switches(on=True)
+    scroll(-6000, tries=3)  # to the bottom
+    return flip_all_switches(on=True) or changed
 
 
 def step_save():
@@ -1250,6 +1277,11 @@ def run():
         mark()
         _watching = True
     _watching = False
+    # close anything still open (settings dialog, popups, menus)
+    focus_studio()
+    for _ in range(5):
+        press_esc()
+        time.sleep(0.08)
     print("\nPublished and secured.")
 
 
