@@ -7,9 +7,9 @@ Publishes a Roblox place file from start to finish without you touching anything
 *2× speed. [Full-length video (real time, ~40 s)](docs/showcase.mp4)*
 
 1. Opens the place in Roblox Studio (the newest one in your downloads folder, or the file you give it)
-2. Waits until Studio has fully loaded (Play button ready, not just the window showing)
-3. Opens the publish dialog (Alt+P), turns **off** every switch there (**Team Create**, **Data Sharing**), publishes
-4. Closes the "Manage Audience" popup
+2. Presses Alt+P about once a second until the publish dialog opens - the moment Studio is ready
+3. Turns **off** every switch in the publish dialog (**Team Create**, **Data Sharing**), publishes
+4. Closes the "Manage Audience" popup (and publishes again automatically if an error popup shows up)
 5. Opens **File > Experience Settings > Security**, turns **every** switch **on**, saves
 
 A full run takes about 35–40 seconds, most of it Studio loading and uploading. Built for quickly getting test places (for example ones built with Rojo) published as private experiences.

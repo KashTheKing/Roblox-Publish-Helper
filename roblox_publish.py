@@ -31,7 +31,7 @@ except Exception:
 
 import numpy as np
 import pyautogui as pg
-from PIL import Image, ImageGrab
+from PIL import Image
 
 pg.PAUSE = 0.02  # pyautogui waits 0.1s after every action by default; Studio keeps up fine
 
@@ -65,9 +65,11 @@ DEFAULT_CONFIG = {
     "poll_interval": 0.1,
     "step_timeout": 30,
     "toggle_timeout": 3,
+    # Can't find a button for this long: ask you to click it once (then it's remembered)
+    "teach_after": 5,
+    "teach_timeout": 120,
     "publish_timeout": 180,
     "studio_load_timeout": 180,
-    "after_load_delay": 1,
     # How alike (0-1) the screen must be to a button image. Real matches score ~0.95+.
     # Lower a little if buttons aren't found, raise if it clicks too early.
     "match_score": 0.8,
@@ -75,7 +77,6 @@ DEFAULT_CONFIG = {
 
 # name: (calibration hint, capture width, capture height)
 BUTTONS = {
-    "studio_ready": ("between the Play and Stop buttons once Studio is FULLY loaded (Play blue, Stop dull)", 110, 30),
     "file_menu": ("the word 'File' in Studio's menu bar", 34, 18),
     "switch_off": ("any OFF switch in Experience Settings > Security (just the switch)", 44, 28),
     "switch_on": ("any ON (green) switch, e.g. Team Create in the Alt+P dialog (just the switch)", 44, 28),
@@ -86,7 +87,7 @@ BUTTONS = {
     "save_button": ("the Save button in Experience Settings", 70, 30),
 }
 
-COLOR_MATTERS = {"studio_ready", "switch_off", "switch_on"}
+COLOR_MATTERS = {"switch_off", "switch_on"}
 
 cfg = dict(DEFAULT_CONFIG)
 state = {"place": None, "proc": None, "window": None, "windows_before": set()}
@@ -436,7 +437,6 @@ def load_template(path, built_in):
 # Where in Studio's window each item can be (fractions of width/height): searching less
 # screen is much faster. Anything not listed is searched in the middle, where dialogs open.
 REGIONS = {
-    "studio_ready": (0, 0, 0.4, 0.15),
     "file_menu": (0, 0, 0.3, 0.1),
     "experience_settings": (0, 0, 0.35, 0.7),
 }
@@ -514,9 +514,65 @@ def load_needles(name):
     return _needle_cache[key]
 
 
+# ---------- learned positions: first run finds things, later runs go straight there ----------
+
+LEARNED_PATH = APP_DIR / "learned.json"
+_learned = None
+
+
+def learned():
+    global _learned
+    if _learned is None:
+        try:
+            _learned = json.loads(LEARNED_PATH.read_text())
+        except (OSError, ValueError):
+            _learned = {}
+    return _learned
+
+
+def anchor_rect(name):
+    """What a remembered position is relative to: the Studio dialog it's in, or Studio's window."""
+    if name not in REGIONS and (dialog := studio_dialog_rect()):
+        return dialog
+    return studio_area()
+
+
+def remember(name, pos):
+    anchor = anchor_rect(name)
+    if not anchor:
+        return
+    spot = [pos[0] - anchor[0], pos[1] - anchor[1]]
+    if learned().get(name) != spot:
+        learned()[name] = spot
+        try:
+            LEARNED_PATH.write_text(json.dumps(learned(), indent=2))
+        except OSError:
+            pass
+
+
+def at_learned_spot(name, needles):
+    """Check just the remembered spot - a few milliseconds - before searching everywhere."""
+    if name not in learned() or not (anchor := anchor_rect(name)):
+        return None
+    x, y = anchor[0] + learned()[name][0], anchor[1] + learned()[name][1]
+    for needle, needle_rgb in needles:
+        h, w = needle.raw.shape
+        m = 12  # a little slack around it
+        box = (x - w // 2 - m, y - h // 2 - m, x - w // 2 + w + m, y - h // 2 + h + m)
+        try:
+            shot = grab_box(*box)
+        except OSError:
+            return None
+        hit = locate_prepared(Prepared(gray(shot)), needle, cfg["match_score"])
+        if hit and (name not in COLOR_MATTERS or colors_match(shot, hit, needle_rgb)):
+            return box[0] + hit[0] + w // 2, box[1] + hit[1] + h // 2
+    return None
+
+
 def find(name, timeout):
     """Wait search_start_delay after the last action, then poll the screen for any of the
-    item's images. Returns the screen position of its center, or None after timeout."""
+    item's images: its remembered spot first, then everywhere it could be. Returns the screen
+    position of its center, or None after timeout."""
     needles = load_needles(name)
     if not needles:
         raise Fail(f"no image for '{name}' - run: calibrate \"{name}\"")
@@ -525,21 +581,61 @@ def find(name, timeout):
     while True:
         check_cancel()
         focus_studio()
+        if pos := at_learned_spot(name, needles):
+            return pos
         area = region_area(name)
         shot = screenshot(area)
         hay = Prepared(gray(shot))
         for needle, needle_rgb in needles:
             hit = locate_prepared(hay, needle, cfg["match_score"])
-            # Color only matters for Play/Stop (blue vs greyed out) and switches (an ON switch is
-            # the same shape, but green); text has ClearType color fringes that differ pixel to
-            # pixel, so text is matched on shape alone
+            # Color only matters for switches (an ON switch is the same shape, but green); text
+            # has ClearType color fringes that differ pixel to pixel, so it's matched on shape
             if hit and (name not in COLOR_MATTERS or colors_match(shot, hit, needle_rgb)):
                 h, w = needle.full.shape
                 ox, oy = area[:2] if area else screen_origin()
-                return hit[0] + ox + w // 2, hit[1] + oy + h // 2
+                pos = hit[0] + ox + w // 2, hit[1] + oy + h // 2
+                remember(name, pos)
+                return pos
         if time.time() > end:
             return None
         wait(cfg["poll_interval"])
+
+
+def teach(name):
+    """Couldn't find it: ask the user to click it once in Studio. Their click does the action;
+    the button's image and position are saved so later runs find it instantly.
+    Returns where they clicked."""
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+    user32.GetAncestor.restype = wintypes.HWND
+    hint = BUTTONS[name][0] if name in BUTTONS else f"the '{name}' label"
+    show_console(True)
+    print(f"\n  >>> Help needed: I can't find {hint}.")
+    print("      Click it in Studio yourself - I'll remember it for next time. (Esc stops, F8 skips.)")
+    user32.GetAsyncKeyState(0x01)  # forget earlier clicks
+    end = time.time() + cfg["teach_timeout"]
+    while time.time() < end:
+        check_cancel()
+        if user32.GetAsyncKeyState(0x01) & 0x8000:  # left button down
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            window = user32.GetAncestor(user32.WindowFromPoint(pt), 2)  # GA_ROOT
+            if exe_name(window) == "robloxstudiobeta.exe":
+                _, w, h = BUTTONS.get(name, ("", 160, 26))
+                TEMPLATE_DIR.mkdir(exist_ok=True)
+                grab(pt.x, pt.y, w, h).save(user_template_path(name))
+                _needle_cache.clear()
+                remember(name, (pt.x, pt.y))
+                while user32.GetAsyncKeyState(0x01) & 0x8000:  # wait for the release
+                    time.sleep(0.02)
+                mark()
+                show_console(False)
+                print(f"    learned {name} - thanks!")
+                return pt.x, pt.y
+        time.sleep(0.02)
+    raise Fail(f"couldn't find {hint} (nobody clicked it)")
 
 
 # ---------- user-input cancel ----------
@@ -606,10 +702,13 @@ def mark():
 
 
 def click(name, timeout=None):
-    timeout = timeout or cfg["step_timeout"]
+    """Find and click a button; if it can't be found, ask the user to click it once (learned)."""
+    timeout = min(timeout or cfg["step_timeout"], cfg["teach_after"])
     pos = find(name, timeout)
     if not pos:
-        raise Fail(blank_screen_hint() or f"couldn't find '{name}' on screen after {timeout}s")
+        if hint := blank_screen_hint():
+            raise Fail(hint)
+        return teach(name)  # their click did it
     pg.click(*pos)
     mark()
     print(f"    clicked {name}")
@@ -756,14 +855,6 @@ def step_launch():
     raise Fail("Studio window never appeared")
 
 
-def step_wait_loaded():
-    focus_studio()
-    # The File menu shows while plugins still load; Play turning blue (Stop dull) means ready
-    if not find("studio_ready", cfg["studio_load_timeout"]):
-        raise Fail(blank_screen_hint() or "Studio didn't finish loading (Play button never became ready)")
-    wait(cfg["after_load_delay"])  # let plugins/startup popups settle
-
-
 def front_dialog_title():
     """Title of the Studio dialog in front ("Publish Experience", "Manage Audience", ...), or ""."""
     fg = ctypes.windll.user32.GetForegroundWindow()
@@ -787,12 +878,19 @@ def dialog_showing(title_word, image, timeout):
 
 
 def step_open_publish():
-    focus_studio()
-    if not dialog_showing("publish", "publish_button", 0):
-        pg.hotkey("alt", "p")
-        mark()
-    if not dialog_showing("publish", "publish_button", cfg["step_timeout"]):
-        raise Fail(blank_screen_hint() or "publish dialog didn't open")
+    """Press Alt+P about once a second until the publish dialog opens - Studio ignores it
+    while still loading, so this opens it the moment Studio is ready."""
+    end = time.time() + cfg["studio_load_timeout"]
+    next_press = 0.0
+    while not dialog_showing("publish", "publish_button", 0):
+        if time.time() > end:
+            raise Fail(blank_screen_hint() or "publish dialog never opened (is Studio still loading?)")
+        if time.time() >= next_press:
+            focus_studio()
+            pg.hotkey("alt", "p")
+            mark()
+            next_press = time.time() + 1.0
+        wait(0.15)
 
 
 def step_publish():
@@ -834,15 +932,24 @@ def blue_button_in_corner():
 
 
 def click_main_button(name):
-    """Click a dialog's blue main button: by its image, or else by finding the blue button in
-    the dialog's bottom-right corner (for PCs where the image doesn't match)."""
-    pos = find(name, 2)
-    how = name
-    if not pos:
-        focus_studio()
-        pos, how = blue_button_in_corner(), f"{name} (by color)"
-    if not pos:
-        raise Fail(blank_screen_hint() or f"couldn't find '{name}' on screen")
+    """Click a dialog's blue main button: by its image or by finding the blue button in the
+    dialog's bottom-right corner (for PCs where the image doesn't match) - whichever shows
+    first, checking both every time. Neither: ask the user to click it once (learned)."""
+    end = time.time() + cfg["teach_after"]
+    while True:
+        check_cancel()
+        pos, how = find(name, 0), name
+        if not pos:
+            focus_studio()
+            pos, how = blue_button_in_corner(), f"{name} (by color)"
+        if pos:
+            break
+        if time.time() > end:
+            if hint := blank_screen_hint():
+                raise Fail(hint)
+            teach(name)  # their click did it
+            return
+        wait(0.1)
     pg.click(*pos)
     mark()
     print(f"    clicked {how}")
@@ -856,7 +963,7 @@ class RetryFrom(Fail):
         self.step = step
 
 
-OPEN_PUBLISH_STEP = 3  # index in STEPS
+OPEN_PUBLISH_STEP = 2  # index in STEPS
 
 
 def step_wait_published():
@@ -886,31 +993,59 @@ def step_wait_published():
     click("publish_close", 2)
 
 
-def step_open_security():
-    # Right after publishing, Studio sometimes swallows a click - so check each part opened
-    # and redo just that part quickly, instead of waiting long timeouts
-    tab = None
-    for attempt in range(8):
-        if attempt and (tab := find("security_tab", 0)):  # already open (e.g. on a retry)
-            break
-        item = find("experience_settings", 0) if attempt else None  # File menu already open?
-        if not item:
-            if attempt:
-                focus_studio()
-                press_esc()  # close any half-open menu or leftover popup
-            click("file_menu")
-            if not (item := find("experience_settings", 1.5)):
-                continue
-        pg.click(*item)
+def open_file_menu():
+    """Open Studio's File menu - Alt+F from the keyboard, the 'File' image as a backup.
+    Returns where 'Experience Settings' is in it, or None."""
+    focus_studio()
+    pg.hotkey("alt", "f")
+    mark()
+    if item := find("experience_settings", 1.0):
+        print("    opened File menu (Alt+F)")
+        return item
+    press_esc()
+    if pos := find("file_menu", 1.0):
+        pg.click(*pos)
         mark()
-        print("    clicked experience_settings")
+        print("    clicked file_menu")
+        return find("experience_settings", 1.0)
+    return None
+
+
+def step_open_security():
+    # Right after publishing, Studio sometimes ignores a key or click - so check each part
+    # opened and redo just that part quickly. Still nothing: ask the user to click it once.
+    tab = None
+    for attempt in range(3):
+        if attempt:
+            if tab := find("security_tab", 0):  # already open (e.g. on a retry)
+                break
+            focus_studio()
+            press_esc()  # close any half-open menu or leftover popup
+        item = open_file_menu()
+        if not item and attempt < 2:
+            continue
+        if item:
+            pg.click(*item)
+            mark()
+            print("    clicked experience_settings")
+        else:  # last try: let the user show us
+            if not find("experience_settings", 0):
+                teach("file_menu")
+            if item := find("experience_settings", 1.5):
+                pg.click(*item)
+                mark()
+            else:
+                teach("experience_settings")
         if tab := find("security_tab", 4):
             break
+    if not tab:
+        if "settings" not in front_dialog_title().lower():
+            raise Fail(blank_screen_hint() or "Experience Settings didn't open")
+        tab = teach("security_tab")
     else:
-        raise Fail("Experience Settings didn't open")
-    pg.click(*tab)
-    mark()
-    print("    clicked security_tab")
+        pg.click(*tab)
+        mark()
+        print("    clicked security_tab")
     state["security_tab_pos"] = tab
 
 
@@ -1038,8 +1173,7 @@ def step_save():
 STEPS = [
     ("Pick place file", step_pick_place),
     ("Launch Roblox Studio", step_launch),
-    ("Wait for Studio to load", step_wait_loaded),
-    ("Open publish dialog", step_open_publish),
+    ("Open publish dialog (as soon as Studio is ready)", step_open_publish),
     ("Set publish toggles + publish", step_publish),
     ("Wait for publish to finish", step_wait_published),
     ("Open Experience Settings > Security", step_open_security),
