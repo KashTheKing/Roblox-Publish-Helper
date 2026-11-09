@@ -613,14 +613,17 @@ def teach(name):
     hint = BUTTONS[name][0] if name in BUTTONS else f"the '{name}' label"
     show_console(True)
     print(f"\n  >>> Help needed: I can't find {hint}.")
-    print("      Click it in Studio yourself - I'll remember it for next time. (Esc stops, F8 skips.)")
+    print("      Ctrl+Click it in Studio - that click does the step and I'll remember it for next time.")
+    print("      (Normal clicks are ignored, so you can click around to get there. Esc stops, F8 skips.)")
     ctypes.windll.user32.MessageBeep(0x30)
     focus_studio()  # Studio back in front, so this window can't cover what you need to click
     user32.GetAsyncKeyState(0x01)  # forget earlier clicks
     end = time.time() + cfg["teach_timeout"]
     while time.time() < end:
         check_cancel()
-        if user32.GetAsyncKeyState(0x01) & 0x8001:  # left button down, or clicked since last look
+        clicked = user32.GetAsyncKeyState(0x01) & 0x8001  # left button down, or clicked since last look
+        ctrl = user32.GetAsyncKeyState(0x11) & 0x8000
+        if clicked and ctrl:  # only Ctrl+Click teaches - plain clicks are the user getting around
             pt = wintypes.POINT()
             user32.GetCursorPos(ctypes.byref(pt))
             window = user32.GetAncestor(user32.WindowFromPoint(pt), 2)  # GA_ROOT

@@ -64,7 +64,7 @@ Run `roblox-publish-helper.exe setup` to answer the first-run questions again. U
 
 ## How it finds buttons
 
-**It learns your setup.** The first run finds everything and remembers where each button was (in `learned.json` next to the exe); later runs check those exact spots first, which takes milliseconds. If it can't find a button at all, its window pops up and asks you to **click that button in Studio once** - your click does the step, and the button is remembered for every run after.
+**It learns your setup.** The first run finds everything and remembers where each button was (in `learned.json` next to the exe); later runs check those exact spots first, which takes milliseconds. If it can't find a button at all, its window pops up and asks you to **Ctrl+Click that button in Studio once** - your click does the step, and the button is remembered for every run after. Plain clicks are ignored while it waits, so you can click around to get to the button first.
 
 It looks for small reference images of each button on screen, only inside the Studio window (or the Studio dialog in front), and recognises dialogs by their window titles. Menus are opened from the keyboard where possible (Alt+P for publish; Alt, then Down for the File menu). Matching compares the pattern of light and dark, so a wallpaper-tinted or lighter/darker background doesn't throw it off. Built-in images come from Studio's **dark theme** and cover both the older UI and the November 2026 UI (some buttons have two images). They're resized automatically for Windows display scaling (125%, 150%, ...). To re-capture images by hand instead (or after deleting `learned.json` and `templates\` to start over):
 
